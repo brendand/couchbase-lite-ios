@@ -236,6 +236,65 @@
 #pragma mark - UPDATING _attachments DICTS:
 
 
+- (BOOL) registerAttachmentBodies: (NSDictionary*)attachments
+                      forRevision: (CBL_MutableRevision*)rev
+                            error: (NSError**)outError
+{
+    __block BOOL ok = YES;
+    [rev mutateAttachments: ^NSDictionary *(NSString *name, NSDictionary *meta) {
+        if (!meta[@"data"] && ![meta[@"stub"] isEqual: $true]) {
+            @autoreleasepool {
+                id value = attachments[name];
+                Assert(value, @"No body given for following attachment '%@'", name);
+                NSData* data = $castIf(NSData, value);
+                if (!data) {
+                    NSURL* url = $castIf(NSURL, value);
+                    if (url.isFileURL) {
+                        data = [NSData dataWithContentsOfURL: url
+                                                     options: NSDataReadingMappedIfSafe
+                                                       error: outError];
+                    } else {
+                        Warn(@"attachments[\"%@\"] is neither NSData nor file NSURL", name);
+                        CBLStatusToOutNSError(kCBLStatusBadAttachment, outError);
+                    }
+                    if (!data) {
+                        ok = NO;
+                        return nil;
+                    }
+                }
+
+                // Register attachment body with database:
+                CBL_BlobStoreWriter* writer = self.attachmentWriter;
+                [writer appendData: data];
+                [writer finish];
+
+                // Add or verify metadata "digest" property:
+                NSString* digest = meta[@"digest"];
+                NSString* sha1Digest = writer.SHA1DigestString;
+                NSMutableDictionary* nuMeta = [meta mutableCopy];
+                if (digest) {
+                    if (![digest isEqualToString: sha1Digest] &&
+                        ![digest isEqualToString: writer.MD5DigestString]) {
+                        Warn(@"Attachment '%@' body digest (%@) doesn't match 'digest' property %@",
+                             name, sha1Digest, digest);
+                        CBLStatusToOutNSError(kCBLStatusBadAttachment, outError);
+                        ok = NO;
+                        return nil;
+                    }
+                } else {
+                    nuMeta[@"digest"] = digest = sha1Digest;
+                }
+                nuMeta[@"follows"] = @YES;
+                [self rememberAttachmentWriter: writer forDigest: digest];
+                return nuMeta;
+            }
+        }
+        return meta;
+    }];
+    return ok;
+}
+
+
 static UInt64 smallestLength(NSDictionary* attachment) {
     UInt64 length = [attachment[@"length"] unsignedLongLongValue];
     NSNumber* encodedLength = attachment[@"encoded_length"];
