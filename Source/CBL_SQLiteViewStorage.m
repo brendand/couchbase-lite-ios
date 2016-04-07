@@ -602,6 +602,37 @@ static NSString* viewNames(NSArray* views) {
 #pragma mark - QUERYING:
 
 
+/** Main internal call to query a view. */
+- (CBLQueryEnumerator*) queryWithOptions: (CBLQueryOptions*)options
+                                  status: (CBLStatus*)outStatus
+{
+    SequenceNumber lastSeq = self.lastSequenceIndexed;
+    NSArray* rows;
+    if (options.fullTextQuery)
+        rows = [self fullTextQueryWithOptions: options status: outStatus];
+    else if ([self groupOrReduceWithOptions: options])
+        rows = [self reducedQueryWithOptions: options status: outStatus];
+    else
+        rows = [self regularQueryWithOptions: options status: outStatus];
+
+    if (!rows)
+        return nil;
+    return [[CBLQueryEnumerator alloc] initWithSequenceNumber: lastSeq rows: rows];
+    //OPT: Return objects from enum as they're found, without collecting them in an array first
+}
+
+
+// Should this query be run as grouped/reduced?
+- (BOOL) groupOrReduceWithOptions: (CBLQueryOptions*) options {
+    if (options->group || options->groupLevel > 0)
+        return YES;
+    else if (options->reduceSpecified)
+        return options->reduce;
+    else
+        return (_delegate.reduceBlock != nil); // Reduce defaults to true iff there's a reduce block
+}
+
+
 typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString* docID,
                                    CBL_FMResultSet* r);
 
@@ -610,9 +641,6 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
 - (CBLStatus) _runQueryWithOptions: (const CBLQueryOptions*)options
                              onRow: (QueryRowBlock)onRow
 {
-    if (!options)
-        options = [CBLQueryOptions new];
-
     // OPT: It would be faster to use separate tables for raw-or ascii-collated views so that
     // they could be indexed with the right collation, instead of having to specify it here.
     NSString* collationStr = @"";
@@ -647,13 +675,11 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         [sql appendString:@")"];
     }
 
-    id minKey = options.startKey, maxKey = options.endKey;
+    id minKey = options.minKey, maxKey = options.maxKey;
     NSString* minKeyDocID = options.startKeyDocID;
     NSString* maxKeyDocID = options.endKeyDocID;
     BOOL inclusiveMin = options->inclusiveStart, inclusiveMax = options->inclusiveEnd;
     if (options->descending) {
-        minKey = options.endKey;
-        maxKey = options.startKey;
         inclusiveMin = options->inclusiveEnd;
         inclusiveMax = options->inclusiveStart;
         minKeyDocID = options.endKeyDocID;
@@ -673,7 +699,6 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         }
     }
     if (maxKey) {
-        maxKey = CBLKeyForPrefixMatch(maxKey, options->prefixMatchLevel);
         NSData* maxKeyData = toJSONData(maxKey);
         [sql appendString: (inclusiveMax ? @" AND key <= ?" :  @" AND key < ?")];
         [sql appendString: collationStr];
@@ -745,8 +770,8 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
 }
 
 
-- (CBLQueryIteratorBlock) regularQueryWithOptions: (CBLQueryOptions*)options
-                                           status: (CBLStatus*)outStatus
+- (NSArray*) regularQueryWithOptions: (CBLQueryOptions*)options
+                              status: (CBLStatus*)outStatus
 {
     CBL_SQLiteStorage* db = _dbStorage;
 
@@ -758,8 +783,6 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         // underlying query, so handle them specially:
         limit = options->limit;
         skip = options->skip;
-        if (limit == 0)
-            return queryIteratorBlockFromArray(nil); // empty result set
         options->limit = kCBLQueryOptionsDefaultLimit;
         options->skip = 0;
     }
@@ -808,19 +831,17 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
                                             boundingBox: bbox
                                             geoJSONData: [r dataForColumn: @"geokey"]
                                                   value: valueData
-                                            docRevision: docRevision
-                                                storage: self];
+                                            docRevision: docRevision];
         } else {
             row = [[CBLQueryRow alloc] initWithDocID: docID
                                             sequence: sequence
                                                  key: keyData
                                                value: valueData
-                                         docRevision: docRevision
-                                             storage: self];
+                                         docRevision: docRevision];
         }
 
         if (filter) {
-            if (!filter(row))
+            if (![self row: row passesFilter: filter])
                 return kCBLStatusOK;
             if (skip > 0) {
                 --skip;
@@ -854,15 +875,13 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         }
         rows = sortedRows;
     }
-
-    //OPT: Return objects from enum as they're found, without collecting them in an array first
-    return queryIteratorBlockFromArray(rows);
+    return rows;
 }
 
 
 /** Runs a full-text query of a view, using the FTS4 table. */
-- (CBLQueryIteratorBlock) fullTextQueryWithOptions: (const CBLQueryOptions*)options
-                                            status: (CBLStatus*)outStatus
+- (NSArray*) fullTextQueryWithOptions: (const CBLQueryOptions*)options
+                               status: (CBLStatus*)outStatus
 {
     if (![self createFullTextSchema]) {
         *outStatus = kCBLStatusNotImplemented;
@@ -883,6 +902,7 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
         [sql appendString: @" DESC"];
     [sql appendString: @" LIMIT ? OFFSET ?"];
     int limit = (options->limit != kCBLQueryOptionsDefaultLimit) ? options->limit : -1;
+    CBLQueryRowFilter filter = options.filter;
 
     CBL_SQLiteStorage* dbStorage = _dbStorage;
     CBL_FMResultSet* r = [dbStorage.fmdb executeQuery: [self queryString: sql],
@@ -905,8 +925,7 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
             CBLFullTextQueryRow* row = [[CBLFullTextQueryRow alloc] initWithDocID: docID
                                                                          sequence: sequence
                                                                        fullTextID: fulltextID
-                                                                            value: valueData
-                                                                          storage: self];
+                                                                            value: valueData];
             // Parse the offsets as a space-delimited list of numbers, into an NSArray.
             // (See http://sqlite.org/fts3.html#section_4_1 )
             NSArray* offsets = [[r stringForColumnIndex: 4] componentsSeparatedByString: @" "];
@@ -919,16 +938,25 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
 
             if (options->fullTextSnippets)
                 row.snippet = [r stringForColumnIndex: 5];
-            if (!options.filter || options.filter(row))
+            if (!filter || [self row: row passesFilter: filter])
                 [rows addObject: row];
         }
     }
-
-    //OPT: Return objects from enum as they're found, without collecting them in an array first
-    return queryIteratorBlockFromArray(rows);
+    return rows;
 }
 
 
+- (BOOL) row: (CBLQueryRow*)row passesFilter: (CBLQueryRowFilter)filter {
+    //FIX: I'm not supposed to know the delegates' real classes...
+    [row moveToDatabase: _dbStorage.delegate view: _delegate];
+    if (!filter(row))
+        return NO;
+    [row _clearDatabase];
+    return YES;
+}
+
+
+#ifndef MY_DISABLE_LOGGING
 static inline NSString* toJSONString( id object ) {
     if (!object)
         return nil;
@@ -956,6 +984,7 @@ static id fromJSON( NSData* json ) {
                                options: CBLJSONReadingAllowFragments
                                  error: NULL];
 }
+#endif
 
 
 #pragma mark - REDUCING/GROUPING:
@@ -1000,10 +1029,11 @@ static id callReduce(CBLReduceBlock reduceBlock, NSMutableArray* keys, NSMutable
 }
 
 
-- (CBLQueryIteratorBlock) reducedQueryWithOptions: (CBLQueryOptions*)options
-                                           status: (CBLStatus*)outStatus
+- (NSArray*) reducedQueryWithOptions: (CBLQueryOptions*)options
+                              status: (CBLStatus*)outStatus
 {
     CBL_SQLiteStorage* db = _dbStorage;
+    CBLQueryRowFilter filter = options.filter;
     unsigned groupLevel = options->groupLevel;
     bool group = options->group || groupLevel > 0;
     CBLReduceBlock reduce = _delegate.reduceBlock;
@@ -1038,9 +1068,8 @@ static id callReduce(CBLReduceBlock reduceBlock, NSMutableArray* keys, NSMutable
                                                              sequence: 0
                                                                   key: key
                                                                 value: reduced
-                                                          docRevision: nil
-                                                              storage: self];
-                if (!options.filter || options.filter(row))
+                                                          docRevision: nil];
+                if (!filter || [self row: row passesFilter: filter])
                     [rows addObject: row];
                 [keysToReduce removeAllObjects];
                 [valuesToReduce removeAllObjects];
@@ -1077,22 +1106,11 @@ static id callReduce(CBLReduceBlock reduceBlock, NSMutableArray* keys, NSMutable
                                                      sequence: 0
                                                           key: key
                                                         value: reduced
-                                                  docRevision: nil
-                                                      storage: self];
-        if (!options.filter || options.filter(row))
+                                                  docRevision: nil];
+        if (!filter || [self row: row passesFilter: filter])
             [rows addObject: row];
     }
-
-    //OPT: Return objects from enum as they're found, without collecting them in an array first
-    return queryIteratorBlockFromArray(rows);
-}
-
-
-static CBLQueryIteratorBlock queryIteratorBlockFromArray(NSArray* rows) {
-    NSEnumerator* rowEnum = rows.objectEnumerator;
-    return ^CBLQueryRow*() {
-        return rowEnum.nextObject;
-    };
+    return rows;
 }
 
 

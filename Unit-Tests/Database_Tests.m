@@ -350,6 +350,7 @@
 
     NSError* error;
     Assert(([doc putExistingRevisionWithProperties: @{@"foo": @2}
+                                       attachments: nil
                                    revisionHistory: @[@"3-cafebabe", @"2-feedba95", doc.currentRevisionID]
                                            fromURL: nil
                                              error: &error]));
@@ -362,12 +363,14 @@
 
     // Repeat; should be no error:
     Assert(([doc putExistingRevisionWithProperties: @{@"foo": @2}
+                                       attachments: nil
                                    revisionHistory: @[@"3-cafebabe", @"2-feedba95", doc.currentRevisionID]
                                            fromURL: nil
                                              error: &error]));
 
     // Add a deleted revision:
     Assert(([doc putExistingRevisionWithProperties: @{@"foo": @-1, @"_deleted": @YES}
+                                       attachments: nil
                                    revisionHistory: @[@"3-deadbeef", @"2-feedba95", doc.currentRevisionID]
                                            fromURL: nil
                                              error: &error]));
@@ -378,6 +381,31 @@
                                    @"_rev": @"3-deadbeef",
                                    @"_deleted": @YES,
                                    @"foo": @-1}));
+}
+
+
+- (void) test072_PutExistingRevisionWithAttachment {
+    CBLDocument* doc = db[@"some-doc"];
+
+    NSData* content = [@"hi there" dataUsingEncoding: NSUTF8StringEncoding];
+    NSDictionary* props = @{@"_attachments": @{@"foo.txt": @{@"content_type": @"text/plain"}}};
+    NSDictionary* attachments = @{@"foo.txt": content};
+
+    NSError* error;
+    Assert(([doc putExistingRevisionWithProperties: props
+                                       attachments: attachments
+                                   revisionHistory: @[@"1-cafebabe"]
+                                           fromURL: nil
+                                             error: &error]));
+
+    CBLRevision* rev = doc.currentRevision;
+    Assert(rev);
+    Assert(!rev.isDeletion);
+    AssertEqual(rev.revisionID, @"1-cafebabe");
+    CBLAttachment* a = [rev attachmentNamed: @"foo.txt"];
+    Assert(a);
+    AssertEqual(a.contentType, @"text/plain");
+    AssertEqual(a.content, content);
 }
 
 
@@ -645,6 +673,72 @@
         AssertEq(doc.currentRevision.sequence, n);
     }
     AssertEq(n, 5);
+}
+
+
+- (void) test12_AllDocumentsBySequenceDescending {
+    static const NSUInteger kNDocs = 10;
+    [self createDocuments: kNDocs];
+
+    // clear the cache so all documents/revisions will be re-fetched:
+    [db _clearDocumentCache];
+
+    CBLQuery* query = [db createAllDocumentsQuery];
+    query.descending = YES;
+    query.allDocsMode = kCBLBySequence;
+    CBLQueryEnumerator* rows = [query run: NULL];
+    SequenceNumber n = kNDocs;
+    for (CBLQueryRow* row in rows) {
+        CBLDocument* doc = row.document;
+        Assert(doc, @"Couldn't get doc from query");
+        AssertEq(doc.currentRevision.sequence, n);
+        n--;
+    }
+    AssertEq(n, 0);
+
+    query = [db createAllDocumentsQuery];
+    query.descending = YES;
+    query.allDocsMode = kCBLBySequence;
+    query.startKey = @3;
+    rows = [query run: NULL];
+    n = 3;
+    for (CBLQueryRow* row in rows) {
+        CBLDocument* doc = row.document;
+        Assert(doc, @"Couldn't get doc from query");
+        AssertEq(doc.currentRevision.sequence, n);
+        n--;
+    }
+    AssertEq(n, 0);
+
+    query = [db createAllDocumentsQuery];
+    query.descending = YES;
+    query.allDocsMode = kCBLBySequence;
+    query.endKey = @6;
+    rows = [query run: NULL];
+    n = kNDocs;
+    for (CBLQueryRow* row in rows) {
+        CBLDocument* doc = row.document;
+        Assert(doc, @"Couldn't get doc from query");
+        AssertEq(doc.currentRevision.sequence, n);
+        n--;
+    }
+    AssertEq(n, 5);
+
+    query = [db createAllDocumentsQuery];
+    query.descending = YES;
+    query.allDocsMode = kCBLBySequence;
+    query.startKey = @6;
+    query.endKey = @3;
+    query.inclusiveStart = query.inclusiveEnd = NO;
+    rows = [query run: NULL];
+    n = 5;
+    for (CBLQueryRow* row in rows) {
+        CBLDocument* doc = row.document;
+        Assert(doc, @"Couldn't get doc from query");
+        AssertEq(doc.currentRevision.sequence, n);
+        n--;
+    }
+    AssertEq(n, 3);
 }
 
 

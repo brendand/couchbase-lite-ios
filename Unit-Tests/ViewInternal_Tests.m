@@ -10,6 +10,7 @@
 #import "CouchbaseLitePrivate.h"
 #import "CBLView+Internal.h"
 #import "CBLQuery+Geo.h"
+#import "CBLQueryRow+Router.h"
 #import "CBLDatabase+Insertion.h"
 #import "CBLInternal.h"
 
@@ -125,22 +126,22 @@ static NSDictionary* mkGeoRect(double x0, double y0, double x1, double y1) {
 }
 
 
-static NSArray* rowsToDicts(CBLQueryIteratorBlock iterator) {
+static NSArray* rowsToDicts(NSEnumerator* iterator) {
     NSCParameterAssert(iterator!=nil);
     NSMutableArray* rows = $marray();
     CBLQueryRow* row;
-    while (nil != (row = iterator()))
+    while (nil != (row = iterator.nextObject))
         [rows addObject: row.asJSONDictionary];
     return rows;
 }
 
 
-static NSArray* rowsToDictsSettingDB(CBLDatabase* db, CBLQueryIteratorBlock iterator) {
+static NSArray* rowsToDictsSettingDB(CBLView* view, NSEnumerator* iterator) {
     NSCParameterAssert(iterator!=nil);
     NSMutableArray* rows = $marray();
     CBLQueryRow* row;
-    while (nil != (row = iterator())) {
-        row.database = db;
+    while (nil != (row = iterator.nextObject)) {
+        [row moveToDatabase: view.database view: view];
         [rows addObject: row.asJSONDictionary];
     }
     return rows;
@@ -764,7 +765,7 @@ static NSArray* reverse(NSArray* a) {
     options->reduceSpecified = YES;
     options->reduce = NO;
     CBLStatus status;
-    NSArray* rows = rowsToDictsSettingDB(db, [view _queryWithOptions: options status: &status]);
+    NSArray* rows = rowsToDictsSettingDB(view, [view _queryWithOptions: options status: &status]);
     NSArray* expectedRows = $array($dict({@"id",  @"55555"}, {@"key", @"five"},
                                          {@"value", [docs[4] properties]}),
                                    $dict({@"id",  @"44444"}, {@"key", @"four"},
@@ -779,13 +780,13 @@ static NSArray* reverse(NSArray* a) {
 
     // Now test reducing
     options->reduce = YES;
-    CBLQueryIteratorBlock reduced = [view _queryWithOptions: options status: &status];
+    NSEnumerator* reduced = [view _queryWithOptions: options status: &status];
     Assert(reduced != NULL);
     AssertEq(status, kCBLStatusOK);
-    CBLQueryRow* row = reduced();
-    row.database = db;
+    CBLQueryRow* row = reduced.nextObject;
+    [row moveToDatabase: db view: view];
     AssertEqual(row.value, @"fivefouronethreetwo");
-    AssertNil(reduced());
+    AssertNil(reduced.nextObject);
 }
 
 - (void) test13_NumericKeys {
@@ -822,7 +823,7 @@ static NSArray* reverse(NSArray* a) {
     CBLGeoRect bbox = {{-100, 0}, {180, 90}};
     options->bbox = &bbox;
     CBLStatus status;
-    NSArray* rows = rowsToDictsSettingDB(db, [view _queryWithOptions: options status: &status]);
+    NSArray* rows = rowsToDictsSettingDB(view, [view _queryWithOptions: options status: &status]);
     NSArray* expectedRows = @[$dict({@"id", @"xxx"},
                                     {@"geometry", mkGeoRect(-115, -10, -90, 12)},
                                     {@"bbox", @[@-115, @-10, @-90, @12]}),
@@ -881,7 +882,7 @@ static NSArray* reverse(NSArray* a) {
 
     // Query all rows:
     CBLQueryOptions *options = [CBLQueryOptions new];
-    CBLQueryIteratorBlock query = [db getAllDocs: options status: &status];
+    NSEnumerator* query = [db getAllDocs: options status: &status];
     NSArray* expectedRows = $array(expectedRow[2], expectedRow[0], expectedRow[3], expectedRow[1],
                                    expectedRow[4]);
     AssertEqual(rowsToDicts(query), expectedRows);
@@ -914,7 +915,7 @@ static NSArray* reverse(NSArray* a) {
     options = [CBLQueryOptions new];
     options.keys = @[];
     query = [db getAllDocs: options status: &status];
-    Assert(query == nil || query() == nil);
+    Assert(query == nil || query.nextObject == nil);
     
     // Get specific documents:
     options = [CBLQueryOptions new];
@@ -1399,7 +1400,7 @@ static NSArray* reverse(NSArray* a) {
     options.fullTextQuery = @"stormy OR dog";
     options->fullTextRanking = NO;
     options->fullTextSnippets = YES;
-    CBLQueryIteratorBlock rowIter = [view _queryWithOptions: options status: &status];
+    NSEnumerator* rowIter = [view _queryWithOptions: options status: &status];
     Assert(rowIter, @"_queryFullText failed: %d", status);
     Log(@"rows = %@", rowIter);
     NSArray* expectedRows = $array($dict({@"id",  @"44444"},
@@ -1411,7 +1412,7 @@ static NSArray* reverse(NSArray* a) {
                                                         @{@"range": @[@22, @3], @"term": @1}]},
                                          {@"snippet", @"a [dog] whøse ñame was “[Dog]”"},
                                          {@"value", @"33333"}));
-    AssertEqualish(rowsToDicts(rowIter), expectedRows);
+    AssertEqualish(rowsToDictsSettingDB(view, rowIter), expectedRows);
 
     // Try a query with snippets:
     CBLQuery* query = [view createQuery];
@@ -1465,7 +1466,7 @@ static NSArray* reverse(NSArray* a) {
                                 {@"matches", @[@{@"range": @[@4, @6], @"term": @0}]},
                                 {@"snippet", @"and [STöRMy] night."},
                                 {@"value", @"44444"}));
-    AssertEqualish(rowsToDicts(rowIter), expectedRows);
+    AssertEqualish(rowsToDictsSettingDB(view, rowIter), expectedRows);
 }
 
 

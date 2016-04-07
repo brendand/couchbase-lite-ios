@@ -741,35 +741,47 @@ static SequenceNumber keyToSequence(id key, SequenceNumber dflt) {
 }
 
 
-- (CBLQueryIteratorBlock) getAllDocs: (CBLQueryOptions*)options
-                              status: (CBLStatus*)outStatus
+- (CBLQueryEnumerator*) getAllDocs: (CBLQueryOptions*)options
+                            status: (CBLStatus*)outStatus
 {
+    if (!options)
+        options = [CBLQueryOptions new];
+    else if (options.isEmpty)
+        return [[CBLQueryEnumerator alloc] initWithDatabase: self
+                                                       view: nil
+                                             sequenceNumber: self.lastSequenceNumber
+                                                       rows: nil];
+
     // For regular all-docs, let storage do it all:
-    if (!options || options->allDocsMode != kCBLBySequence)
-        return [_storage getAllDocs: options status: outStatus];
+    if (options->allDocsMode != kCBLBySequence) {
+        CBLQueryEnumerator* e = [_storage getAllDocs: options status: outStatus];
+        [e setDatabase: self view: nil];
+        return e;
+    }
 
     // For changes feed mode (kCBLBySequence) do more work here:
-    if (options->descending) {
-        *outStatus = kCBLStatusNotImplemented;    //FIX: Implement descending order
-        return nil;
+    SequenceNumber lastSeq = _storage.lastSequence;
+    SequenceNumber minSeq = keyToSequence(options.minKey, 1);
+    SequenceNumber maxSeq = keyToSequence(options.maxKey, INT64_MAX);
+    if (!(options->descending ? options->inclusiveEnd : options->inclusiveStart))
+        ++minSeq;
+    if (!(options->descending ? options->inclusiveStart : options->inclusiveEnd))
+        --maxSeq;
+    if (minSeq > maxSeq || minSeq > lastSeq) {
+        // Empty result:
+        *outStatus = kCBLStatusOK;
+        return [[CBLQueryEnumerator alloc] initWithDatabase: self
+                                                       view: nil
+                                             sequenceNumber: lastSeq
+                                                       rows: nil];
     }
+
     CBLChangesOptions changesOpts = {
         .limit = options->limit,
         .includeDocs = options->includeDocs,
         .includeConflicts = YES,
         .sortBySequence = YES
     };
-    SequenceNumber startSeq = keyToSequence(options.startKey, 1);
-    SequenceNumber endSeq = keyToSequence(options.endKey, INT64_MAX);
-    if (!options->inclusiveStart)
-        ++startSeq;
-    if (!options->inclusiveEnd)
-        --endSeq;
-    SequenceNumber minSeq = startSeq, maxSeq = endSeq;
-    if (minSeq > maxSeq) {
-        *outStatus = kCBLStatusOK;
-        return nil;  // empty result
-    }
     CBL_RevisionList* revs = [_storage changesSinceSequence: minSeq - 1
                                                     options: &changesOpts
                                                      filter: nil
@@ -777,33 +789,36 @@ static SequenceNumber keyToSequence(id key, SequenceNumber dflt) {
     if (!revs)
         return nil;
 
+    NSMutableArray* result = [NSMutableArray arrayWithCapacity: revs.count];
     NSEnumerator* revEnum = (options->descending) ? revs.allRevisions.reverseObjectEnumerator
                                                   : revs.allRevisions.objectEnumerator;
-    return ^CBLQueryRow*() {
-        for (;;) {
-            CBL_Revision* rev = revEnum.nextObject;
-            if (!rev)
-                return nil;
-            SequenceNumber seq = rev.sequence;
-            if (seq < minSeq || seq > maxSeq)
-                return nil;
-            NSDictionary* value = $dict({@"rev", rev.revID},
-                                        {@"deleted", (rev.deleted ?$true : nil)});
-            CBLQueryRow* row =  [[CBLQueryRow alloc] initWithDocID: rev.docID
-                                                          sequence: seq
-                                                               key: rev.docID
-                                                             value: value
-                                                       docRevision: rev
-                                                           storage: nil];
-            if (!options.filter)
-                return row;
-            row.database = self;
-            if (options.filter(row)) {
-                //row.database = nil;
-                return row;
-            }
+    for (CBL_Revision* rev in revEnum) {
+        SequenceNumber seq = rev.sequence;
+        if (seq > maxSeq) {
+            if (options->descending)
+                continue;
+            else
+                break;
         }
-    };
+        NSDictionary* value = $dict({@"rev", rev.revID},
+                                    {@"deleted", (rev.deleted ?$true : nil)});
+        CBLQueryRow* row =  [[CBLQueryRow alloc] initWithDocID: rev.docID
+                                                      sequence: seq
+                                                           key: rev.docID
+                                                         value: value
+                                                   docRevision: rev];
+        if (options.filter) {
+            [row moveToDatabase: self view: nil];
+            if (!options.filter(row))
+                continue;
+        }
+        [result addObject: row];
+    }
+
+    return [[CBLQueryEnumerator alloc] initWithDatabase: self
+                                                   view: nil
+                                         sequenceNumber: lastSeq
+                                                   rows: result];
 }
 
 

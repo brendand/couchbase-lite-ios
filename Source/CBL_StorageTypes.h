@@ -14,10 +14,6 @@
 /** Predicate block that can filter rows of a query result. */
 typedef BOOL (^CBLQueryRowFilter)(CBLQueryRow*);
 
-/** Block-based iterator for returning query results. 
-    Returns next row every time it's called, then returns nil at the end. */
-typedef CBLQueryRow* (^CBLQueryIteratorBlock)(void);
-
 /** Document validation callback, passed to the insertion methods. */
 typedef CBLStatus(^CBL_StorageValidationBlock)(CBL_Revision* newRev,
                                                CBL_Revision* prev,
@@ -56,6 +52,12 @@ typedef CBLStatus(^CBL_StorageValidationBlock)(CBL_Revision* newRev,
 @property (copy, nonatomic) NSArray* keys;
 @property (copy, nonatomic) CBLQueryRowFilter filter;
 @property (copy, nonatomic) NSString* fullTextQuery;
+
+@property (readonly) id minKey;     // startKey, or endKey if descending=YES
+@property (readonly) id maxKey;     // Max of the key range, taking into account prefixMatchLevel
+
+/** Checks whether limit=0 or keys=[] */
+@property (readonly) BOOL isEmpty;
 
 @end
 

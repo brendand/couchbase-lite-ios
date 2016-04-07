@@ -54,6 +54,18 @@ NSString* const kCBLViewChangeNotification = @"CBLViewChange";
     return self;
 }
 
+- (BOOL) isEmpty {
+    return limit == 0 || (keys && keys.count == 0);
+}
+
+- (id) minKey {
+    return descending ? endKey : startKey;
+}
+
+- (id) maxKey {
+    return CBLKeyForPrefixMatch(descending ? startKey : endKey, prefixMatchLevel);
+}
+
 @end
 
 
@@ -376,34 +388,24 @@ static id<CBLViewCompiler> sCompiler;
 
 
 /** Main internal call to query a view. */
-- (CBLQueryIteratorBlock) _queryWithOptions: (CBLQueryOptions*)options
-                                     status: (CBLStatus*)outStatus
+- (CBLQueryEnumerator*) _queryWithOptions: (CBLQueryOptions*)options
+                                   status: (CBLStatus*)outStatus
 {
     if (!options)
         options = [CBLQueryOptions new];
-    CBLQueryIteratorBlock iterator;
-    if (options.fullTextQuery) {
-        iterator = [_storage fullTextQueryWithOptions: options status: outStatus];
-    } else if ([self groupOrReduceWithOptions: options])
-        iterator = [_storage reducedQueryWithOptions: options status: outStatus];
-    else
-        iterator = [_storage regularQueryWithOptions: options status: outStatus];
-    if (iterator)
+    else if (options.isEmpty)
+        return [[CBLQueryEnumerator alloc] initWithDatabase: self.database
+                                                       view: self
+                                             sequenceNumber: self.lastSequenceIndexed
+                                                       rows: nil];
+
+    CBLQueryEnumerator* e = [_storage queryWithOptions: options status: outStatus];
+    [e setDatabase: self.database view: self];
+    if (e)
         LogTo(Query, @"Query %@: Returning iterator", _name);
     else
         LogTo(Query, @"Query %@: Failed with status %d", _name, *outStatus);
-    return iterator;
-}
-
-
-// Should this query be run as grouped/reduced?
-- (BOOL) groupOrReduceWithOptions: (CBLQueryOptions*) options {
-    if (options->group || options->groupLevel > 0)
-        return YES;
-    else if (options->reduceSpecified)
-        return options->reduce;
-    else
-        return (self.reduceBlock != nil); // Reduce defaults to true iff there's a reduce block
+    return e;
 }
 
 
